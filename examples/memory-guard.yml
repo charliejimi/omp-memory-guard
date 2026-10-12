@@ -1,0 +1,16 @@
+# omp-memory-guard: settings overlay for the Day19 memory sequence.
+# Use it with `omp --config examples/memory-guard.yml`. Keep the keys nested: omp ignores
+# flat dotted keys such as `mnemopi.autoRecall: false` at the top level.
+memory:
+  backend: mnemopi
+mnemopi:
+  # Memories stay out of the system prompt; the model calls recall or reflect when it needs them.
+  autoRecall: false
+  # Finished turns are not stored automatically, so every write is a tool call the guard can check.
+  autoRetain: false
+  # One bank per project, so a memory stored in one repository is not recalled in another.
+  scoping: per-project
+# Load the guard last, so it sees what other extensions add to the system prompt and tool results.
+# extensions:
+#   - /path/to/another-extension
+#   - /path/to/omp-memory-guard
