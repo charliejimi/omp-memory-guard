@@ -127,7 +127,9 @@ export async function loadGuard(paths: string[] = [PACKAGE], cwd: string = tempD
 		} as never);
 	const beforeAgentStart = (systemPrompt: unknown) =>
 		runner.emitBeforeAgentStart("hello", undefined, systemPrompt as never);
-	return { runner, cwd, notices, handlerErrors, toolCall, toolResult, beforeAgentStart };
+	const context = async (messages: unknown[]) =>
+		(await runner.emitContext(messages as never)) as unknown as Array<Record<string, unknown> | null>;
+	return { runner, cwd, notices, handlerErrors, toolCall, toolResult, beforeAgentStart, context };
 }
 
 /** The single text part of a tool result the guard replaced. */

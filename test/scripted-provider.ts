@@ -1,9 +1,11 @@
 // Test-only model provider for the live runs. It plays a script instead of calling a model, so real
 // omp runs its real tools, hooks, settings, and memory without network access, and it records every
 // request it receives: exactly what a model would have seen.
-//   SCRIPTED_PROVIDER_SCRIPT  JSON file: { "steps": [{ "toolCalls": [{ "name", "arguments" }] } | { "text" }] }
-//                             Request N plays step N; once the steps run out it answers "done".
-//   SCRIPTED_PROVIDER_LOG     JSONL file; each request's system prompt and messages are appended.
+//   SCRIPTED_PROVIDER_SCRIPT  JSON file: { "steps": [{ "toolCalls": [{ "name", "arguments" }] } | { "text" }],
+//                             "summary": "…" }. Main request N plays step N; once the steps run out it
+//                             answers "done". A compaction summary request (omp's summarization system
+//                             prompt) is answered with `summary` and uses no step.
+//   SCRIPTED_PROVIDER_LOG     JSONL file; each request's kind, system prompt, and messages are appended.
 // omp resolves the @oh-my-pi imports to its own copies when it loads this file.
 import * as fs from "node:fs";
 import type { Api, AssistantMessage, Context, Model, ToolCall, Usage } from "@oh-my-pi/pi-ai";
@@ -15,12 +17,21 @@ export interface ScriptStep {
 	text?: string;
 }
 
-let requests = 0;
+interface Script {
+	steps?: ScriptStep[];
+	summary?: string;
+}
 
-function steps(): ScriptStep[] {
+/** How omp's summarization system prompt for compaction begins. */
+const SUMMARIZATION_PROMPT = "Summarize user";
+
+let requests = 0;
+let mainRequests = 0;
+
+function script(): Script {
 	const file = process.env.SCRIPTED_PROVIDER_SCRIPT;
-	if (!file) return [];
-	return (JSON.parse(fs.readFileSync(file, "utf8")) as { steps?: ScriptStep[] }).steps ?? [];
+	if (!file) return {};
+	return JSON.parse(fs.readFileSync(file, "utf8")) as Script;
 }
 
 function emptyUsage(): Usage {
@@ -36,12 +47,15 @@ function emptyUsage(): Usage {
 
 function play(model: Model<Api>, context: Context) {
 	const index = requests++;
+	const loaded = script();
+	const kind = (context.systemPrompt ?? []).join("\n").startsWith(SUMMARIZATION_PROMPT) ? "summary" : "main";
 	const log = process.env.SCRIPTED_PROVIDER_LOG;
 	if (log) {
-		const entry = { request: index, systemPrompt: context.systemPrompt ?? [], messages: context.messages };
+		const entry = { request: index, kind, systemPrompt: context.systemPrompt ?? [], messages: context.messages };
 		fs.appendFileSync(log, `${JSON.stringify(entry)}\n`);
 	}
-	const step = steps()[index] ?? { text: "done" };
+	const step: ScriptStep =
+		kind === "summary" ? { text: loaded.summary ?? "## Goal\n- (scripted summary)" } : (loaded.steps?.[mainRequests++] ?? { text: "done" });
 	const stream = createAssistantMessageEventStream();
 	const message: AssistantMessage = {
 		role: "assistant",

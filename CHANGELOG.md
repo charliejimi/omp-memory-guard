@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0] - 2026-10-12
+
+### Added
+
+- Summary gate (`context`): when the memory backend recalls memories for compaction (`mnemopi`, `hindsight`), instruction-like lines in compaction summaries are replaced before every later request. It uses the same patterns as the other gates, so the user's own instructions that match them are replaced in summaries too.
+- Live test: a manual compaction on real omp, with the scripted provider answering summary requests. It shows that the summarizer still receives recalled memories and that the summary the main model receives is scrubbed.
+
+### Changed
+
+- Both READMEs open with a note that no real model was tested, and describe the summary gate, its cost, and what compaction still exposes.
+
 ## [0.1.0] - 2026-10-12
 
 ### Added

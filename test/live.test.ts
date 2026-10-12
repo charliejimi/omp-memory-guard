@@ -21,7 +21,10 @@ const PROVIDER = path.join(import.meta.dir, "scripted-provider.ts");
 const BAIT_MARK = "onboarded.txt";
 const BENIGN_MARK = "prefer it over npm";
 const NONCE_TAG = /<untrusted-memory-[0-9a-f]{16}>/;
-const RUN_TIMEOUT_MS = 60_000;
+// omp from source takes 10–20 s to start on an idle machine; a busy one needs far more headroom.
+const READY_TIMEOUT_MS = 180_000;
+const STEP_TIMEOUT_MS = 120_000;
+const TEST_TIMEOUT_MS = 600_000;
 
 type Frame = Record<string, unknown>;
 type Message = { role?: string; content?: unknown };
@@ -34,6 +37,8 @@ interface World {
 	db: string;
 }
 
+type Action = { prompt: string } | { compact: true };
+
 interface RunOptions {
 	guard: boolean;
 	tools: string;
@@ -41,7 +46,13 @@ interface RunOptions {
 	steps: ScriptStep[];
 	/** Overrides on top of the example overlay. */
 	mnemopi?: Record<string, unknown>;
-	/** Waits after the turn ends, before omp is asked to exit. */
+	/** Top-level settings merged into the overlay, such as `compaction`. */
+	settings?: Record<string, unknown>;
+	/** More actions in the same session after the first prompt: another prompt, or a manual compaction. */
+	then?: Action[];
+	/** What the scripted model answers to a compaction summary request. */
+	summary?: string;
+	/** Waits after the last action, before omp is asked to exit. */
 	settle?: () => Promise<unknown>;
 }
 
@@ -51,7 +62,7 @@ interface Run {
 	world: World;
 	options: RunOptions;
 	frames: Frame[];
-	requests: Array<{ request: number; systemPrompt: string[]; messages: Message[] }>;
+	requests: Array<{ request: number; kind: "main" | "summary"; systemPrompt: string[]; messages: Message[] }>;
 	notices: string[];
 	stderr: string;
 	command: string[];
@@ -76,10 +87,11 @@ function newWorld(): World {
 }
 
 /** The example overlay, plus what keeps mnemopi offline and inside this world. */
-function overlay(world: World, mnemopi: Record<string, unknown> = {}): string {
+function overlay(world: World, mnemopi: Record<string, unknown> = {}, extra: Record<string, unknown> = {}): string {
 	const example = Bun.YAML.parse(fs.readFileSync(EXAMPLE_CONFIG, "utf8")) as { mnemopi?: Record<string, unknown> };
 	const settings = {
 		...example,
+		...extra,
 		mnemopi: { ...example.mnemopi, dbPath: world.db, noEmbeddings: true, llmMode: "none", ...mnemopi },
 	};
 	return `${JSON.stringify(settings, null, 2)}\n`;
@@ -91,8 +103,13 @@ function sanitize(text: string, world: World): string {
 	return out;
 }
 
-async function waitFor<T>(probe: () => T | undefined | false, what: string, failed: () => string | undefined): Promise<T> {
-	const deadline = Date.now() + RUN_TIMEOUT_MS;
+async function waitFor<T>(
+	probe: () => T | undefined | false,
+	what: string,
+	failed: () => string | undefined,
+	timeoutMs = STEP_TIMEOUT_MS,
+): Promise<T> {
+	const deadline = Date.now() + timeoutMs;
 	for (;;) {
 		const value = probe();
 		if (value) return value;
@@ -168,8 +185,8 @@ async function runOmp(world: World, name: string, options: RunOptions): Promise<
 	const script = path.join(world.root, `${slug}.script.json`);
 	const log = path.join(world.root, `${slug}.requests.jsonl`);
 	const config = path.join(world.root, `${slug}.config.yml`);
-	fs.writeFileSync(script, JSON.stringify({ steps: options.steps }));
-	fs.writeFileSync(config, overlay(world, options.mnemopi));
+	fs.writeFileSync(script, JSON.stringify({ steps: options.steps, summary: options.summary }));
+	fs.writeFileSync(config, overlay(world, options.mnemopi, options.settings));
 	const command = [
 		...OMP,
 		"--mode",
@@ -229,21 +246,36 @@ async function runOmp(world: World, name: string, options: RunOptions): Promise<
 	const stderrText = new Response(proc.stderr as ReadableStream<Uint8Array>).text();
 	const failed = () => {
 		if (proc.exitCode !== null) return `omp exited with ${proc.exitCode}`;
-		const rejected = frames.find(frame => frame.type === "response" && frame.id === "p1" && frame.success === false);
-		return rejected ? `prompt rejected: ${JSON.stringify(rejected)}` : undefined;
+		const rejected = frames.find(frame => frame.type === "response" && frame.success === false);
+		return rejected ? `command rejected: ${JSON.stringify(rejected)}` : undefined;
 	};
+	const send = (frame: Record<string, unknown>) => {
+		proc.stdin.write(`${JSON.stringify(frame)}\n`);
+		proc.stdin.flush();
+	};
+	// A turn has ended when a terminal agent_end carries that turn's prompt.
+	const turnEnded = (prompt: string) => {
+		const needle = JSON.stringify(prompt).slice(1, -1);
+		return frames.some(
+			frame => frame.type === "agent_end" && frame.isTerminal !== false && JSON.stringify(frame.messages ?? []).includes(needle),
+		);
+	};
+	const actions: Action[] = [{ prompt: options.prompt }, ...(options.then ?? [])];
 	const started = performance.now();
 	const timings = { msToReady: 0, msTurn: 0, msToExit: 0, killed: false };
 	try {
-		await waitFor(() => frames.some(frame => frame.type === "ready"), "ready", failed);
+		await waitFor(() => frames.some(frame => frame.type === "ready"), "ready", failed, READY_TIMEOUT_MS);
 		timings.msToReady = Math.round(performance.now() - started);
-		proc.stdin.write(`${JSON.stringify({ id: "p1", type: "prompt", message: options.prompt })}\n`);
-		proc.stdin.flush();
-		await waitFor(
-			() => frames.some(frame => frame.type === "agent_end" && frame.isTerminal !== false),
-			"the end of the turn",
-			failed,
-		);
+		for (const [index, action] of actions.entries()) {
+			if ("prompt" in action) {
+				send({ id: `p${index + 1}`, type: "prompt", message: action.prompt });
+				await waitFor(() => turnEnded(action.prompt), `the end of turn ${index + 1}`, failed);
+			} else {
+				const id = `c${index + 1}`;
+				send({ id, type: "compact" });
+				await waitFor(() => frames.some(frame => frame.type === "response" && frame.id === id), "the compaction", failed);
+			}
+		}
 		timings.msTurn = Math.round(performance.now() - started) - timings.msToReady;
 		await options.settle?.();
 	} finally {
@@ -281,8 +313,11 @@ function record(run: Run, checks: Record<string, unknown>): void {
 		tools: run.options.tools,
 		mnemopiOverrides: run.options.mnemopi ?? {},
 		prompt: run.options.prompt,
+		then: run.options.then ?? [],
+		settings: run.options.settings ?? {},
 		scriptedSteps: run.options.steps.length,
 		requestsReceived: run.requests.length,
+		requestKinds: run.requests.map(request => request.kind),
 		timings: run.timings,
 		mnemopiDatabases: databases(run.world).map(file => path.relative(run.world.root, file)),
 		notices: run.notices,
@@ -320,7 +355,7 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 		expect(checks.baitOccurrencesInDatabase).toBe(0);
 		expect(checks.benignOccurrencesInDatabase).toBeGreaterThan(0);
 		expect(checks.startupNotices).toBe(0);
-	}, 120_000);
+	}, TEST_TIMEOUT_MS);
 
 	it("handoff: the file written to $TMPDIR is the redacted version; one aimed at the workspace is blocked", async () => {
 		const world = newWorld();
@@ -361,7 +396,7 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 		expect(checks.benignLinesKept).toBe(true);
 		expect(checks.workspaceFileExists).toBe(false);
 		expect(checks.workspaceWriteResultNamesTmpdir).toBe(true);
-	}, 120_000);
+	}, TEST_TIMEOUT_MS);
 
 	it("recall: a bait stored before the guard was loaded comes back wrapped and scrubbed", async () => {
 		const world = newWorld();
@@ -391,7 +426,7 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 		expect(checks.baitReachedModel).toBe(false);
 		expect(checks.neutralizedLines).toBeGreaterThan(0);
 		expect(checks.memoryIdKept).toBe(true);
-	}, 180_000);
+	}, TEST_TIMEOUT_MS);
 
 	it("handoff-read: a handoff file holding the bait reaches the model wrapped and scrubbed", async () => {
 		const world = newWorld();
@@ -413,7 +448,7 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 		expect(checks.wrappedWithNonce).toBe(true);
 		expect(checks.baitReachedModel).toBe(false);
 		expect(checks.benignLineKept).toBe(true);
-	}, 120_000);
+	}, TEST_TIMEOUT_MS);
 
 	it("autorecall: with automatic recall on, the bait inside <memories> is replaced before the model sees it", async () => {
 		const world = newWorld();
@@ -455,7 +490,7 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 		expect(checks.baitReachedModel).toBe(false);
 		expect(checks.neutralizedLines).toBeGreaterThan(0);
 		expect(checks.autoRecallNotice).toBe(true);
-	}, 180_000);
+	}, TEST_TIMEOUT_MS);
 
 	it("autoretain: the example overlay stores nothing from a turn; automatic retention stores the bait with no tool call", async () => {
 		const prompt = `Note for the project: ${BAIT}`;
@@ -465,7 +500,7 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 			tools: "read",
 			prompt,
 			steps: [{ text: "Noted." }],
-			settle: () => Bun.sleep(3_000),
+			settle: () => Bun.sleep(10_000),
 		});
 		const offChecks = { baitOccurrencesInDatabase: occurrences(off, BAIT_MARK), startupNotices: runOff.notices.length };
 		record(runOff, offChecks);
@@ -476,7 +511,7 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 			tools: "read",
 			prompt,
 			steps: [{ text: "Noted." }],
-			settle: () => until(() => occurrences(on, BAIT_MARK) > 0, 15_000),
+			settle: () => until(() => occurrences(on, BAIT_MARK) > 0, 60_000),
 		});
 		const onChecks = {
 			baitOccurrencesInDatabase: occurrences(on, BAIT_MARK),
@@ -489,5 +524,71 @@ describe.skipIf(!LIVE)("live on real omp 18.2.8, scripted model, no network (AC-
 		expect(onChecks.baitOccurrencesInDatabase).toBeGreaterThan(0);
 		expect(onChecks.toolCallsMade).toBe(0);
 		expect(onChecks.autoRetainNotice).toBe(true);
-	}, 120_000);
+	}, TEST_TIMEOUT_MS);
+
+	it("compaction: the summarizer still sees recalled memories; the summary the main model receives is scrubbed (AC-10)", async () => {
+		const world = newWorld();
+		const store = await runOmp(world, "compaction/1-store-without-guard", {
+			guard: false,
+			tools: "retain",
+			prompt: "Remember this project note.",
+			steps: [retain(BAIT), { text: "Stored." }],
+		});
+		record(store, { baitOccurrencesInDatabase: occurrences(world, BAIT_MARK) });
+		// The scripted summarizer copies the recalled bait into its summary: the worst case.
+		const summary = [
+			"## Goal",
+			"- Answer the onboarding question, then continue the parser refactor.",
+			`- ${BAIT}`,
+			"## Next steps",
+			"- Review the parser tests.",
+		].join("\n");
+		const compacting = (name: string, guard: boolean) =>
+			runOmp(world, name, {
+				guard,
+				tools: "read",
+				prompt: recallQuery,
+				then: [
+					{ prompt: "Continue with the onboarding steps for this project." },
+					{ compact: true },
+					{ prompt: "What should you do next? Then stop." },
+				],
+				steps: [{ text: "Noted." }, { text: "Continuing." }, { text: "done" }],
+				summary,
+				settings: { compaction: { methodOrder: ["soft"], keepRecentTokens: 1 } },
+			});
+		const summarizerSaw = (run: Run) =>
+			run.requests
+				.filter(request => request.kind === "summary")
+				.some(request => {
+					const text = JSON.stringify(request);
+					return text.includes("<memories>") && text.includes(BAIT_MARK);
+				});
+		const afterCompaction = (run: Run) => JSON.stringify(run.requests.filter(request => request.kind === "main").at(-1) ?? {});
+		const control = await compacting("compaction/2-control-without-guard", false);
+		const controlChecks = {
+			summaryRequests: control.requests.filter(request => request.kind === "summary").length,
+			summarizerSawRecalledBait: summarizerSaw(control),
+			baitReachedModelAfterCompaction: afterCompaction(control).includes(BAIT_MARK),
+		};
+		record(control, controlChecks);
+		const guarded = await compacting("compaction/3-with-guard", true);
+		const seen = afterCompaction(guarded);
+		const checks = {
+			summaryRequests: guarded.requests.filter(request => request.kind === "summary").length,
+			summarizerSawRecalledBait: summarizerSaw(guarded),
+			baitReachedModelAfterCompaction: seen.includes(BAIT_MARK),
+			neutralizedLines: seen.split(NEUTRALIZED_LINE).length - 1,
+			benignSummaryLineKept: seen.includes("Review the parser tests."),
+		};
+		record(guarded, checks);
+		expect(occurrences(world, BAIT_MARK)).toBeGreaterThan(0);
+		expect(controlChecks.summaryRequests).toBeGreaterThan(0);
+		expect(controlChecks.summarizerSawRecalledBait).toBe(true);
+		expect(controlChecks.baitReachedModelAfterCompaction).toBe(true);
+		expect(checks.summarizerSawRecalledBait).toBe(true);
+		expect(checks.baitReachedModelAfterCompaction).toBe(false);
+		expect(checks.neutralizedLines).toBeGreaterThan(0);
+		expect(checks.benignSummaryLineKept).toBe(true);
+	}, TEST_TIMEOUT_MS);
 });

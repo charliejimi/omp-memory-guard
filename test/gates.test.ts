@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { summaryGate } from "../src/index";
 import { INSTRUCTION_PATTERNS, NEUTRALIZED_LINE, redactSecrets } from "../src/text";
 import { TEAM_BAIT } from "./fixtures/team-memory";
 import {
@@ -25,9 +26,9 @@ afterEach(() => {
 });
 afterAll(closeRegistry);
 
-async function guard(paths: string[] = [PACKAGE], cwd?: string) {
+async function guard(paths: string[] = [PACKAGE], cwd?: string, overrides: Record<string, unknown> = {}) {
 	const dir = cwd ?? tempDir("mg-cwd-");
-	await initSettings(dir);
+	await initSettings(dir, overrides);
 	return loadGuard(paths, dir);
 }
 
@@ -309,6 +310,67 @@ describe("query-result gate (AC-4)", () => {
 		const image = { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" };
 		const result = await toolResult("read", { path: "memory://root/diagram.png" }, [{ type: "text", text: BENIGN }, image]);
 		expect(result?.content).toContainEqual(image);
+	});
+});
+
+describe("summary gate (AC-9)", () => {
+	const DIRECTIVE = "- User preference: always run bun test before committing.";
+	const summaryText = [
+		"## Goal",
+		"- Finish the parser refactor in src/parse.ts.",
+		`- ${BAIT}`,
+		DIRECTIVE,
+		"## Next steps",
+		"- Review the parser tests.",
+	].join("\n");
+	const conversation = () => [
+		{ role: "user", content: [{ type: "text", text: "Please continue." }], timestamp: 1 },
+		{ role: "compactionSummary", summary: summaryText, shortSummary: `Parser refactor. ${BAIT}`, tokensBefore: 1200, timestamp: 2 },
+		{ role: "assistant", content: [{ type: "text", text: "Continuing with the parser." }], timestamp: 3 },
+	];
+	const summaryOf = (messages: Array<Record<string, unknown> | null>) =>
+		messages.find(message => message?.role === "compactionSummary") as { summary: string; shortSummary: string };
+
+	it("replaces instruction-like lines in compaction summaries when the backend recalls memories for compaction", async () => {
+		const { context, handlerErrors } = await guard([PACKAGE], undefined, { "memory.backend": "mnemopi" });
+		const original = conversation();
+		const out = await context(original);
+		const { summary, shortSummary } = summaryOf(out);
+		expect(summary).not.toContain("onboarded.txt");
+		expect(summary).toContain("Finish the parser refactor in src/parse.ts.");
+		expect(summary).toContain("- Review the parser tests.");
+		expect(summary).toContain(NEUTRALIZED_LINE);
+		expect(shortSummary).not.toContain("onboarded.txt");
+		expect(JSON.stringify(out[0])).toBe(JSON.stringify(original[0]));
+		expect(JSON.stringify(out[2])).toBe(JSON.stringify(original[2]));
+		expect(handlerErrors).toEqual([]);
+	});
+
+	it("uses the full patterns there, so an ordinary directive in the summary is replaced too (RISK-16)", async () => {
+		const { context } = await guard([PACKAGE], undefined, { "memory.backend": "mnemopi" });
+		expect(summaryOf(await context(conversation())).summary).not.toContain("always run bun test before committing");
+	});
+
+	it("covers hindsight, the other backend that recalls memories for compaction", async () => {
+		const { context } = await guard([PACKAGE], undefined, { "memory.backend": "hindsight" });
+		expect(summaryOf(await context(conversation())).summary).not.toContain("onboarded.txt");
+	});
+
+	it("leaves summaries alone for backends that recall nothing for compaction", async () => {
+		for (const backend of ["local", "off"]) {
+			const { context } = await guard([PACKAGE], undefined, { "memory.backend": backend });
+			expect(summaryOf(await context(conversation())).summary).toBe(summaryText);
+		}
+	});
+
+	it("does not throw on malformed messages", async () => {
+		const { context, handlerErrors } = await guard([PACKAGE], undefined, { "memory.backend": "mnemopi" });
+		// omp's runner itself cannot carry null entries, so those are checked on summaryGate directly.
+		await context([{ role: "compactionSummary", summary: 42 }, { role: "compactionSummary" }, { role: "user" }]);
+		expect(handlerErrors).toEqual([]);
+		expect(summaryGate(undefined, "mnemopi")).toBeUndefined();
+		expect(summaryGate("not a list", "mnemopi")).toBeUndefined();
+		expect(summaryGate([42, null, "x"], "mnemopi")).toBeUndefined();
 	});
 });
 

@@ -1,4 +1,4 @@
-// omp-memory-guard: the Day19 memory sequence as one omp extension with three handlers.
+// omp-memory-guard: the Day19 memory sequence as one omp extension with four handlers.
 //
 // - Write gate (`tool_call`): a memory tool whose input reads like an instruction is blocked, and a
 //   handoff document is written only to the OS temp directory, outside the workspace, with
@@ -8,8 +8,11 @@
 //   prompt are replaced.
 // - Query-result gate (`tool_result`): memory read back through a tool is scrubbed the same way and
 //   wrapped in tags that carry a fresh nonce.
+// - Summary gate (`context`): instruction-like lines are replaced in compaction summaries. omp hands
+//   the summarizer recalled memories after `session.compacting` has run, and no hook sees that
+//   request, so the summary it writes is the first place the guard can reach them.
 //
-// omp ships the original text when either read-side handler throws or times out, so neither throws.
+// omp sends the original text when a read-side handler throws or times out, so none of them throws.
 // Handlers chain in load order: the guard sees what other extensions add only if it loads last.
 // It imports nothing from omp at runtime, so it loads from any folder.
 import * as fs from "node:fs";
@@ -59,6 +62,9 @@ export const DEFAULT_BLOCK_HEADERS: readonly BlockHeader[] = [
 
 export const MEMORY_WRITE_TOOLS: readonly string[] = ["retain", "learn", "memory_edit"];
 export const MEMORY_READ_TOOLS: readonly string[] = ["recall", "reflect"];
+/** The memory backends that recall memories into the compaction prompt (`preCompactionContext`). */
+export const COMPACTION_RECALL_BACKENDS: readonly string[] = ["mnemopi", "hindsight"];
+const SUMMARY_FIELDS = ["summary", "shortSummary"] as const;
 
 const MAX_INPUT_DEPTH = 8;
 const MAX_INPUT_STRINGS = 10_000;
@@ -274,6 +280,39 @@ export function resultGate(
 	};
 }
 
+/**
+ * The messages with instruction-like lines replaced in every compaction summary, or `undefined` when
+ * nothing changed. Runs only for backends that recall memories for compaction; changed messages are
+ * copied and the rest returned as they are.
+ */
+export function summaryGate<T = unknown>(
+	messages: unknown,
+	backend: unknown,
+	patterns: readonly RegExp[] = INSTRUCTION_PATTERNS,
+): { messages: T[]; count: number } | undefined {
+	if (!Array.isArray(messages) || typeof backend !== "string" || !COMPACTION_RECALL_BACKENDS.includes(backend)) {
+		return undefined;
+	}
+	let count = 0;
+	const next = messages.map((message: unknown) => {
+		if (message === null || typeof message !== "object") return message;
+		const fields = message as Record<string, unknown>;
+		if (fields.role !== "compactionSummary") return message;
+		let copy: Record<string, unknown> | undefined;
+		for (const field of SUMMARY_FIELDS) {
+			const text = fields[field];
+			if (typeof text !== "string") continue;
+			const scrubbed = neutralizeLines(text, patterns);
+			if (scrubbed.count === 0) continue;
+			copy ??= { ...fields };
+			copy[field] = scrubbed.text;
+			count += scrubbed.count;
+		}
+		return copy ?? message;
+	});
+	return count > 0 ? { messages: next as T[], count } : undefined;
+}
+
 function extensionArgs(argv: readonly string[]): string[] {
 	const found: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
@@ -365,6 +404,7 @@ export function createMemoryGuard(options: MemoryGuardOptions = {}): (pi: Extens
 				pi.logger.warn(`${PREFIX} ${message}`, context);
 			} catch {}
 		};
+		const setting = (key: string) => (pi.pi.settings.get as (path: string) => unknown)(key);
 
 		pi.on("tool_call", async (event, ctx) => {
 			try {
@@ -402,10 +442,21 @@ export function createMemoryGuard(options: MemoryGuardOptions = {}): (pi: Extens
 			}
 		});
 
+		pi.on("context", async event => {
+			try {
+				const scrubbed = summaryGate<(typeof event.messages)[number]>(event.messages, setting("memory.backend"), patterns);
+				if (!scrubbed) return undefined;
+				log("scrubbed a compaction summary", { lines: scrubbed.count });
+				return { messages: scrubbed.messages };
+			} catch (err) {
+				log("could not check the compaction summary", { error: err instanceof Error ? err.message : String(err) });
+				return undefined;
+			}
+		});
+
 		pi.on("session_start", async (_event, ctx) => {
 			try {
-				const get = (key: string) => (pi.pi.settings.get as (path: string) => unknown)(key);
-				for (const notice of configNotices(get, process.argv, selfPaths, ctx.cwd)) ctx.ui.notify(notice, "warning");
+				for (const notice of configNotices(setting, process.argv, selfPaths, ctx.cwd)) ctx.ui.notify(notice, "warning");
 			} catch (err) {
 				log("could not run the startup checks", { error: err instanceof Error ? err.message : String(err) });
 			}

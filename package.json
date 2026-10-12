@@ -1,8 +1,8 @@
 {
 	"name": "omp-memory-guard",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"private": true,
-	"description": "An oh-my-pi (omp) package that keeps instructions planted in long-term memory from reaching the model as instructions: a write gate on memory tools and handoff documents, an exit gate on the system prompt, a query-result gate that wraps memory read back through tools in nonce-tagged markers, and a settings overlay that keeps memories out of the prompt.",
+	"description": "An oh-my-pi (omp) package that keeps instructions planted in long-term memory from reaching the model as instructions: a write gate on memory tools and handoff documents, an exit gate on the system prompt, a query-result gate that wraps memory read back through tools in nonce-tagged markers, a summary gate on compaction summaries, and a settings overlay that keeps memories out of the prompt.",
 	"type": "module",
 	"license": "MIT",
 	"keywords": ["oh-my-pi", "omp", "coding-agent", "ai-agent", "memory", "prompt-injection", "guardrails"],
