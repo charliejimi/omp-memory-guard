@@ -15,7 +15,9 @@ export const INSTRUCTION_PATTERNS: readonly RegExp[] = [
 	/\bsystem\s+prompt\b/i,
 	/in\s+every\s+session/i,
 	/before\s+(?:responding|doing\s+anything|you\s+answer)/i,
-	/\balways\s+(?:run|execute|append|create|write|send|email|curl|exfiltrate)\b/i,
+	// Stems, with no closing \b, so a memory stated as a fact ("always creates", "always writes") matches
+	// as well as the imperative ("always create").
+	/\balways\s+(?:run|execut|append|creat|writ|send|email|curl|exfiltrat)/i,
 	/<\/?(?:system|tool_call|tool|instructions?)>/i,
 ];
 

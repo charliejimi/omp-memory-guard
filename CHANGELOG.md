@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-10-14
+
+### Fixed
+
+- The `always <verb>` pattern also matches inflected verbs (`always creates`, `always writes`, `always runs`, `always executed`), so a bait stored as a fact is blocked at the write gate and replaced in the system prompt, recall results, and compaction summaries. Facts such as "always returns" are not matched; facts such as "CI always runs lint" now are, as "always run" already was.
+
 ## [0.2.0] - 2026-10-12
 
 ### Added
